@@ -34,32 +34,44 @@ pub enum ApiError<ErrorShape: DeserializeOwned> {
     Parsing(ParsingError),
 }
 
-/// Response from server, or network error, or JSON parsing error
-pub type ApiResult<ErrorShape> = Result<Blob, ApiError<ErrorShape>>;
+type ApiResult<BlobJson, ErrorJson> = Result<BlobJson, ApiError<ErrorJson>>;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct _ReportsErrorJson {
+    message: String,
+    tip: String,
+    code: i64,
+}
+
+/// https://github.com/toggl/toggl_api_docs/blob/master/reports.md#failed-requests
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ReportsErrorJson {
+    error: _ReportsErrorJson,
+}
+
+type DefaultErrorJson = Vec<String>;
 
 /// Trait to DRY up code to make a request, parse the JSON, and return an ApiError of the
 /// appropriate type if necessary
 trait ConsolidateApiErrors {
-    fn get_json<Blob, ErrorShape>(self) -> ApiResult<Blob, ErrorShape>
+    fn get_json<BlobJson, ErrorJson>(self) -> ApiResult<BlobJson, ErrorJson>
     where
-        Blob: DeserializeOwned,
-        ErrorShape: DeserializeOwned;
+        BlobJson: DeserializeOwned,
+        ErrorJson: DeserializeOwned;
 }
 
-/// Response from server, whether error or correct
+/// Json response from server.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum ApiResponse<Blob, ErrorShape> {
-    Blob(Blob),
-    ServerError(ErrorShape),
+enum ResponseJson<BlobJson, ErrorJson> {
+    BlobJson(BlobJson),
+    ErrorJson(ErrorJson),
 }
 
 impl ConsolidateApiErrors for RequestBuilder {
-    fn get_json<Blob, ErrorShape>(self) -> ApiResult<Blob, ErrorShape>
-    where
-        Blob: DeserializeOwned,
-        ErrorShape: DeserializeOwned,
-    {
+    fn get_json<BlobJson: DeserializeOwned, ErrorJson: DeserializeOwned>(
+        self,
+    ) -> Result<BlobJson, ApiError<ErrorJson>> {
         return match self.send() {
             Err(err) => Err(ApiError::Network(err)),
             Ok(resp) => {
@@ -73,16 +85,18 @@ impl ConsolidateApiErrors for RequestBuilder {
                 let status_code = resp.status().clone();
                 return match resp.text() {
                     Ok(txt) => {
-                        return match serde_json::from_str::<ApiResponse<Blob, ErrorShape>>(&txt) {
+                        // return Ok(serde_json::from_str::<BlobJson>(&txt).unwrap());
+                        return match serde_json::from_str::<ResponseJson<BlobJson, ErrorJson>>(&txt)
+                        {
                             Ok(json) => match json {
-                                ApiResponse::ServerError(errors) => {
+                                ResponseJson::ErrorJson(errors) => {
                                     Err(ApiError::Server(ServerError {
                                         parsed_json: Some(errors),
                                         status_code,
                                         text: None,
                                     }))
                                 }
-                                ApiResponse::Blob(blob) => Ok(blob),
+                                ResponseJson::BlobJson(blob) => Ok(blob),
                             },
                             Err(err) => Err(ApiError::Parsing(ParsingError {
                                 text: txt,
@@ -175,7 +189,7 @@ pub struct TimeEntry {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TotalCurrency {
     currency: String,
-    amount: f64
+    amount: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -185,7 +199,7 @@ pub struct Report<Data> {
     total_count: i64,
     per_page: i64,
     total_currencies: Vec<TotalCurrency>,
-    data: Data
+    data: Vec<Data>,
 }
 
 /*
@@ -200,7 +214,7 @@ pub struct ReportTimeEntry {
     pid: Option<i64>,
 
     /// project name for which the time entry was recorded
-    project: Option<i64>,
+    project: Option<String>,
 
     /// client name for which the time entry was recorded
     client: Option<String>,
@@ -230,7 +244,7 @@ pub struct ReportTimeEntry {
     dur: i64,
 
     /// last time the time entry was updated in ISO 8601 date and time format (YYYY-MM-DDTHH:MM:SS)
-    updated: i64,
+    updated: Option<DateTime<Utc>>,
 
     /// if the stop time is saved on the time entry, depends on user's personal settings.
     use_stop: bool,
@@ -239,7 +253,7 @@ pub struct ReportTimeEntry {
     is_billable: bool,
 
     /// billed amount
-    billable: i64,
+    billable: f64,
 
     /// billable amount currency
     cur: String,
@@ -474,67 +488,60 @@ impl ReportsParams {
 
 // We use serde here to make it easier to build the URL
 #[derive(Serialize, Debug)]
-struct ReportsDetailedParams {
+pub struct ReportsDetailedParams {
     #[serde(flatten)]
     reports_params: ReportsParams,
-    total_count: i64,
-    per_page: i64,
+    page: i64,
 }
 
 impl ReportsDetailedParams {
-    pub fn new(user_agent: String, workspace_id: i64, total_count: i64, per_page: i64) -> Self {
+    pub fn new(user_agent: String, workspace_id: i64, page: i64) -> Self {
         Self {
             reports_params: ReportsParams::new(user_agent, workspace_id),
-            total_count,
-            per_page,
+            page,
         }
     }
 
     pub fn to_url(&self) -> Url {
-        let mut url = Url::parse(REPORTS_API_URL).unwrap();
-        let hi = url.query_pairs_mut();
         let json = serde_json::to_value(self).unwrap();
+        let mut query_params = vec![];
         if let serde_json::Value::Object(map) = json {
             for (key, wrapped_val) in map.into_iter() {
                 if serde_json::Value::Null == wrapped_val {
                     continue;
                 };
-                match wrapped_val {
-                    serde_json::Value::Bool(val) => &val.to_string(),
-                    serde_json::Value::Number(val) => &val.to_string(),
-                    serde_json::Value::String(val) => &val,
-                    serde_json::Value::Array(val) => &val
-                        .into_iter()
-                        .map(|x| x.as_str().unwrap())
-                        .collect::<Vec<&str>>()
-                        .join(","),
+                let to_append = match wrapped_val {
+                    serde_json::Value::Bool(val) => Some(val.to_string()),
+                    serde_json::Value::Number(val) => Some(val.to_string()),
+                    serde_json::Value::String(val) => Some(val),
+                    serde_json::Value::Array(val) => Some(
+                        val.into_iter()
+                            .map(|x| {
+                                if let serde_json::Value::String(val) = x {
+                                    val
+                                } else {
+                                    panic!("Shouldn't happen.")
+                                }
+                            })
+                            .collect::<Vec<String>>()
+                            .join(","),
+                    ),
                     serde_json::Value::Object(val) => {
                         panic!("Key {} had unexpcted val {:?}", key, val)
                     }
-                    serde_json::Value::Null => panic!("Shouldn't happen"),
+                    serde_json::Value::Null => None,
+                };
+
+                if let Some(item) = to_append {
+                    query_params.push((key, item));
                 };
             }
         } else {
             panic!("unexpected val: {:?}", json)
         }
-        return url;
+        return Url::parse_with_params(REPORTS_API_URL, query_params).unwrap();
     }
 }
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct _ReportsErrorJson {
-    message: String,
-    tip: String,
-    code: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ReportsErrorJson {
-    error: _ReportsErrorJson,
-}
-
-type DefaultErrorJson = Vec<String>;
-
 impl<'a> Api<'a> {
     pub fn new(api_key: &'a str) -> Api {
         Api {
@@ -545,13 +552,13 @@ impl<'a> Api<'a> {
 
     fn post_and_get_json<
         BodyJson: Serialize,
-        RespJson: DeserializeOwned,
-        ErrorShape: DeserializeOwned,
+        BlobJson: DeserializeOwned,
+        ErrorJson: DeserializeOwned,
     >(
         &self,
         endpoint: &str,
         body: &BodyJson,
-    ) -> ApiResult<RespJson, ErrorShape> {
+    ) -> ApiResult<BlobJson, ErrorJson> {
         println!("Requesting: {}", endpoint);
         let result = self
             .client
@@ -602,9 +609,12 @@ impl<'a> Api<'a> {
         return result;
     }
 
-    pub fn get_reports_detailed(
+    pub fn reports_detailed(
         &self,
         params: &ReportsDetailedParams,
-    ) -> ApiResult<Vec<ReportTimeEntry>, ReportsErrorJson> {
+    ) -> ApiResult<Report<ReportTimeEntry>, ReportsErrorJson> {
+        let endpoint = params.to_url();
+        println!("Requesting: {}", endpoint);
+        return self.client.get(endpoint).add_api_key(self).get_json();
     }
 }
