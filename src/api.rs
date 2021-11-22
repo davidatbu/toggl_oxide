@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::blocking;
 use reqwest::{self, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -61,14 +61,36 @@ trait ConsolidateApiErrors {
 }
 
 /// Json response from server.
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum ResponseJson<BlobJson, ErrorJson> {
     BlobJson(BlobJson),
     ErrorJson(ErrorJson),
 }
 
-impl ConsolidateApiErrors for RequestBuilder {
+// Serde doesn't aggregate error messaages when all items of an enum fails to match, which is
+// frustrating: https://github.com/serde-rs/serde/issues/773
+// So we implement the Deserialize trait here ourselves, instead of doing #[derive(Deserialize)]
+// Bandaid from: https://users.rust-lang.org/t/serde-untagged-enum-ruins-precise-errors/54128/2
+use serde::de;
+use serde_json::Value;
+impl<'de, BlobJson, ErrorJson> Deserialize<'de> for ResponseJson<BlobJson, ErrorJson>
+where
+    BlobJson: DeserializeOwned,
+    ErrorJson: DeserializeOwned,
+{
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // perhaps catch this error as well, if needed
+        let value = Value::deserialize(deserializer)?;
+        match BlobJson::deserialize(value.clone()) {
+            Ok(blob_json) => Ok(ResponseJson::BlobJson(blob_json)),
+            Err(outer_error) => match ErrorJson::deserialize(value) {
+                Ok(errr_json) => Ok(ResponseJson::ErrorJson(errr_json)),
+                Err(inner_error) => Err(de::Error::custom(format!("Matching BlobJson failed because of {}. Matching ErrorJson failed because of {}", outer_error, inner_error)))
+            },
+        }
+    }
+}
+
+impl ConsolidateApiErrors for blocking::RequestBuilder {
     fn get_json<BlobJson: DeserializeOwned, ErrorJson: DeserializeOwned>(
         self,
     ) -> Result<BlobJson, ApiError<ErrorJson>> {
@@ -102,7 +124,7 @@ impl ConsolidateApiErrors for RequestBuilder {
                                 text: txt,
                                 err: Some(err),
                             })),
-                        }
+                        };
                     }
                     Err(_) => Err(ApiError::Parsing(ParsingError {
                         text: "Couldn't fetch response text.".to_string(),
@@ -119,7 +141,7 @@ trait AddApiKey {
     fn add_api_key(self, api: &Api) -> Self;
 }
 
-impl AddApiKey for RequestBuilder {
+impl AddApiKey for blocking::RequestBuilder {
     fn add_api_key(self, api: &Api) -> Self {
         return self.basic_auth(api.api_key, Some("api_token"));
     }
@@ -184,6 +206,66 @@ pub struct TimeEntry {
     /// Timestamp that is sent in the response, indicates the time item was last update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<DateTime<Utc>>,
+}
+
+// https://github.com/toggl/toggl_api_docs/blob/ee4d544ff9f17af2ebe278df887e3afadfe25028/chapters/clients.md#clients
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Client {
+    pub id: i64,
+    pub wid: i64,
+    pub name: String,
+    pub at: DateTime<Utc>,
+}
+
+// https://github.com/toggl/toggl_api_docs/blob/master/chapters/users.md#users
+#[derive(Serialize, Deserialize, Debug)]
+pub struct User {
+    api_token: String,
+
+    default_wid: i64,
+    email: String,
+    fullname: String,
+    jquery_timeofday_format: String,
+    jquery_date_format: String,
+    timeofday_format: String,
+    date_format: String,
+    /// whether start and stop time are saved on time entry
+    store_start_and_stop_time: bool,
+    /// integer 0-6, Sunday=0
+    beginning_of_week: i64,
+    /// user's language
+    language: String,
+    /// url with the user's profile picture
+    image_url: String,
+    ///  should a piechart be shown on the sidebar
+    sidebar_piechart: bool,
+    /// timestamp of last changes
+    at: DateTime<Utc>,
+    ///  Toggl can send newsletters over e-mail to the user
+    pub send_product_emails: bool,
+    ///  if user receives weekly report
+    pub send_weekly_report: bool,
+    ///  email user about long-running (more than 8 hours) tasks
+    pub send_timer_notifications: bool,
+    ///  google signin enabled
+    pub openid_enabled: bool,
+    ///  timezone user has set on the "My profile" page ( IANA TZ timezones )
+    pub timezone: String,
+
+    /// Extra data
+    time_entries: Option<Vec<TimeEntry>>,
+    projects: Option<Vec<Project>>,
+    tags: Option<Vec<Tag>>,
+    workspaces: Option<Vec<Workspace>>,
+    clients: Option<Vec<Client>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UserResponse {
+    // A unix timestamp that indicates the earliest date at which the data returned here
+    // was changed.
+    since: i64,
+    data: User,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -317,7 +399,7 @@ pub struct Workspace {
     pub at: DateTime<Utc>,
 
     /// URL pointing to the logo [if set, otherwise omited]
-    pub logo_url: String,
+    pub logo_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -389,7 +471,7 @@ pub struct Project {
 /// The main Api object
 pub struct Api<'a> {
     api_key: &'a str,
-    client: Client,
+    client: blocking::Client,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -546,7 +628,7 @@ impl<'a> Api<'a> {
     pub fn new(api_key: &'a str) -> Api {
         Api {
             api_key,
-            client: Client::new(),
+            client: blocking::Client::new(),
         }
     }
 
@@ -609,6 +691,7 @@ impl<'a> Api<'a> {
         return result;
     }
 
+    /// Get reports
     pub fn reports_detailed(
         &self,
         params: &ReportsDetailedParams,
@@ -616,5 +699,29 @@ impl<'a> Api<'a> {
         let endpoint = params.to_url();
         println!("Requesting: {}", endpoint);
         return self.client.get(endpoint).add_api_key(self).get_json();
+    }
+
+    /// Get current user
+    pub fn current_user(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> ApiResult<UserResponse, DefaultErrorJson> {
+        let endpoint = API_URL.to_owned() + "/me";
+
+        // Add params if since is passed
+        let endpoint = match since {
+                Some(datetime) => Url::parse_with_params(
+                    &endpoint,
+                    vec![
+                        ("with_related_data", "true"),
+                        ("since", &datetime.timestamp().to_string()),
+                    ],
+                ).unwrap(),
+                None => Url::parse(&endpoint).unwrap(),
+            };
+
+        println!("Requesting: {}", endpoint);
+        let result = self.client.get(endpoint).add_api_key(self).get_json();
+        return result;
     }
 }
