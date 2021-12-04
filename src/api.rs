@@ -220,8 +220,8 @@ pub struct Client {
 // https://github.com/toggl/toggl_api_docs/blob/master/chapters/users.md#users
 #[derive(Serialize, Deserialize, Debug)]
 pub struct User {
+    id: i64,
     api_token: String,
-
     default_wid: i64,
     email: String,
     fullname: String,
@@ -276,8 +276,9 @@ pub struct TotalCurrency {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Report<Data> {
-    total_grand: i64,
-    total_billable: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_grand: Option<i64>,
+    total_billable: Option<i64>,
     total_count: i64,
     per_page: i64,
     total_currencies: Vec<TotalCurrency>,
@@ -441,6 +442,7 @@ pub struct Project {
     template: Option<bool>,
 
     /// id of the template project used on current project's creation
+    #[serde(skip_serializing_if = "Option::is_none")]
     template_id: Option<i64>,
 
     /// whether the project is billable or not (default true, available only for pro workspaces)
